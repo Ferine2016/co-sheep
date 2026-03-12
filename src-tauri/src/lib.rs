@@ -62,7 +62,91 @@ async fn get_screen_info() -> Result<screen_info::ScreenInfo, String> {
 
 #[tauri::command]
 async fn check_api_key() -> bool {
-    std::env::var("ANTHROPIC_API_KEY").is_ok()
+    onboarding::get_api_key().is_some()
+}
+
+#[tauri::command]
+fn record_interaction(interaction: String) {
+    memory::record_interaction(&interaction);
+}
+
+#[tauri::command]
+async fn get_memory() -> Result<serde_json::Value, String> {
+    Ok(memory::get_brain_for_display())
+}
+
+#[tauri::command]
+async fn open_memory_window(app: tauri::AppHandle) -> Result<(), String> {
+    eprintln!("[co-sheep] Opening memory window");
+    if let Some(win) = app.get_webview_window("memory") {
+        win.set_focus().ok();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "memory",
+        tauri::WebviewUrl::App("memory.html".into()),
+    )
+    .title("Sheep's Brain")
+    .inner_size(550.0, 600.0)
+    .center()
+    .decorations(true)
+    .always_on_top(true)
+    .resizable(true)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_settings() -> Result<onboarding::SheepConfig, String> {
+    Ok(onboarding::load_config().unwrap_or_default())
+}
+
+#[tauri::command]
+async fn save_settings(
+    name: String,
+    personality: String,
+    interval_secs: u64,
+    api_key: String,
+    language: String,
+) -> Result<(), String> {
+    eprintln!(
+        "[co-sheep] Saving settings: name={}, personality={}, interval={}s, language={}, api_key={}",
+        name, personality, interval_secs, language,
+        if api_key.is_empty() { "(empty)" } else { "(set)" }
+    );
+    let config = onboarding::SheepConfig {
+        name,
+        personality,
+        interval_secs,
+        api_key,
+        language,
+    };
+    onboarding::write_config(&config).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
+    eprintln!("[co-sheep] Opening settings window");
+    if let Some(win) = app.get_webview_window("settings") {
+        win.set_focus().ok();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "settings",
+        tauri::WebviewUrl::App("settings.html".into()),
+    )
+    .title("co-sheep Settings")
+    .inner_size(420.0, 520.0)
+    .center()
+    .decorations(true)
+    .always_on_top(true)
+    .resizable(false)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -112,6 +196,12 @@ pub fn run() {
             check_screen_permission,
             update_sheep_bounds,
             set_dragging,
+            get_settings,
+            save_settings,
+            open_settings_window,
+            get_memory,
+            open_memory_window,
+            record_interaction,
         ])
         .setup(|app| {
             eprintln!("[co-sheep] === co-sheep starting ===");
@@ -145,9 +235,21 @@ pub fn run() {
                     .ok();
             }
 
-            // System tray
-            let quit =
-                tauri::menu::MenuItem::with_id(app, "quit", "Quit co-sheep", true, None::<&str>)?;
+            // System tray + macOS app menu
+            let settings_item = tauri::menu::MenuItem::with_id(
+                app,
+                "settings",
+                "Settings...",
+                true,
+                None::<&str>,
+            )?;
+            let memory_item = tauri::menu::MenuItem::with_id(
+                app,
+                "memory",
+                "Sheep's Brain...",
+                true,
+                None::<&str>,
+            )?;
             let pause = tauri::menu::MenuItem::with_id(
                 app,
                 "pause",
@@ -155,20 +257,109 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
-            let menu = tauri::menu::Menu::with_items(app, &[&pause, &quit])?;
+            let quit =
+                tauri::menu::MenuItem::with_id(app, "quit", "Quit co-sheep", true, None::<&str>)?;
+
+            // Tray icon menu
+            let tray_menu = tauri::menu::Menu::with_items(app, &[&settings_item, &memory_item, &pause, &quit])?;
 
             let _tray = tauri::tray::TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .on_menu_event(move |app, event| match event.id().as_ref() {
-                    "quit" => app.exit(0),
-                    "pause" => {
+                .menu(&tray_menu)
+                .menu_on_left_click(true)
+                .on_menu_event(move |app, event| {
+                    eprintln!("[co-sheep] Tray menu event: {}", event.id().as_ref());
+                    match event.id().as_ref() {
+                        "quit" => app.exit(0),
+                        "pause" => {
+                            let paused = COMMENTARY_PAUSED.load(Ordering::Relaxed);
+                            COMMENTARY_PAUSED.store(!paused, Ordering::Relaxed);
+                        }
+                        "settings" => {
+                            let handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(e) = open_settings_window(handle).await {
+                                    eprintln!("[co-sheep] Failed to open settings: {}", e);
+                                }
+                            });
+                        }
+                        "memory" => {
+                            let handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(e) = open_memory_window(handle).await {
+                                    eprintln!("[co-sheep] Failed to open memory: {}", e);
+                                }
+                            });
+                        }
+                        _ => {}
+                    }
+                })
+                .build(app)?;
+
+            // macOS top menu bar — co-sheep submenu with same items
+            let app_menu_settings = tauri::menu::MenuItem::with_id(
+                app,
+                "menu_settings",
+                "Settings...",
+                true,
+                None::<&str>,
+            )?;
+            let app_menu_memory = tauri::menu::MenuItem::with_id(
+                app,
+                "menu_memory",
+                "Sheep's Brain...",
+                true,
+                None::<&str>,
+            )?;
+            let app_menu_pause = tauri::menu::MenuItem::with_id(
+                app,
+                "menu_pause",
+                "Pause Commentary",
+                true,
+                None::<&str>,
+            )?;
+            let app_menu_quit = tauri::menu::MenuItem::with_id(
+                app,
+                "menu_quit",
+                "Quit co-sheep",
+                true,
+                None::<&str>,
+            )?;
+            let app_submenu = tauri::menu::Submenu::with_items(
+                app,
+                "co-sheep",
+                true,
+                &[&app_menu_settings, &app_menu_memory, &app_menu_pause, &app_menu_quit],
+            )?;
+            let app_menu = tauri::menu::Menu::with_items(app, &[&app_submenu])?;
+            app.set_menu(app_menu)?;
+            app.on_menu_event(move |app, event| {
+                eprintln!("[co-sheep] App menu event: {}", event.id().as_ref());
+                match event.id().as_ref() {
+                    "menu_quit" => app.exit(0),
+                    "menu_pause" => {
                         let paused = COMMENTARY_PAUSED.load(Ordering::Relaxed);
                         COMMENTARY_PAUSED.store(!paused, Ordering::Relaxed);
                     }
+                    "menu_settings" => {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = open_settings_window(handle).await {
+                                eprintln!("[co-sheep] Failed to open settings: {}", e);
+                            }
+                        });
+                    }
+                    "menu_memory" => {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = open_memory_window(handle).await {
+                                eprintln!("[co-sheep] Failed to open memory: {}", e);
+                            }
+                        });
+                    }
                     _ => {}
-                })
-                .build(app)?;
+                }
+            });
             eprintln!("[co-sheep] System tray created");
 
             // Spawn cursor tracking loop (for drag-and-drop hit detection)

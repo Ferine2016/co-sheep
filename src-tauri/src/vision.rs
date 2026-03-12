@@ -18,6 +18,18 @@ struct HaikuClassification {
 struct SonnetResponse {
     text: String,
     animation: Option<String>,
+    /// Topic key for opinion tracking (e.g. "twitter_usage")
+    #[serde(default)]
+    opinion_topic: Option<String>,
+    /// The opinion itself
+    #[serde(default)]
+    opinion: Option<String>,
+    /// Category: "habit", "fact", "opinion", "pattern"
+    #[serde(default)]
+    opinion_category: Option<String>,
+    /// What to count today (e.g. "twitter_visits", "code_errors")
+    #[serde(default)]
+    count: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -67,13 +79,15 @@ pub async fn vision_loop(app: tauri::AppHandle) {
             }
         }
 
-        // Wait 2-3 minutes (randomized)
+        // Wait based on configured interval (with ±20% randomization)
+        let base = crate::onboarding::get_interval_secs();
+        let jitter = (base as f64 * 0.2) as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
-        let delay = 120 + (now % 60) as u64;
-        eprintln!("[co-sheep] Next vision check in {}s", delay);
+        let delay = base - jitter + (now as u64 % (jitter * 2 + 1));
+        eprintln!("[co-sheep] Next vision check in {}s (base: {}s)", delay, base);
         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
     }
 }
@@ -82,12 +96,12 @@ pub async fn vision_loop(app: tauri::AppHandle) {
 /// Emits user-facing messages via speech bubble for each failure.
 /// Returns true if everything is ready.
 async fn check_prerequisites(app: &tauri::AppHandle) -> bool {
-    // 1. Check API key
-    if std::env::var("ANTHROPIC_API_KEY").is_err() {
-        eprintln!("[co-sheep] ANTHROPIC_API_KEY not set");
+    // 1. Check API key (config or env var)
+    if crate::onboarding::get_api_key().is_none() {
+        eprintln!("[co-sheep] No API key found (checked config + env)");
         app.emit(
             "sheep-commentary",
-            "I can't see anything without an API key! Set ANTHROPIC_API_KEY in your environment and restart me.",
+            "I can't see anything without an API key! Open Settings from the tray menu, or set ANTHROPIC_API_KEY in your environment.",
         )
         .ok();
         return false;
@@ -131,8 +145,8 @@ async fn run_vision_pipeline(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("[co-sheep] --- Vision pipeline tick ---");
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "ANTHROPIC_API_KEY not set")?;
+    let api_key = crate::onboarding::get_api_key()
+        .ok_or("No API key configured")?;
 
     // Log preflight status but don't block — actual capture is the real test
     if !permissions::has_screen_capture_permission() {
@@ -174,29 +188,55 @@ async fn run_vision_pipeline(
     .await?;
     eprintln!("[co-sheep] Sonnet raw response: {}", raw_response);
 
-    // Parse structured response (text + optional animation)
-    let event = parse_commentary_response(&raw_response);
+    // Parse structured response
+    let parsed = parse_commentary_response(&raw_response);
     eprintln!(
-        "[co-sheep] Parsed: text={}, animation={:?}",
-        event.text, event.animation
+        "[co-sheep] Parsed: text={}, animation={:?}, opinion={:?}, count={:?}",
+        parsed.event.text, parsed.event.animation, parsed.opinion_topic, parsed.count
     );
 
+    // Save/update opinion if the sheep formed one
+    if let (Some(ref topic), Some(ref opinion)) = (&parsed.opinion_topic, &parsed.opinion) {
+        let category = parsed
+            .opinion_category
+            .as_deref()
+            .unwrap_or("opinion");
+        memory::save_opinion(topic, opinion, category).ok();
+    }
+
+    // Increment daily counter if the sheep is tracking something
+    if let Some(ref key) = parsed.count {
+        let n = memory::increment_today(key);
+        eprintln!("[co-sheep] Counter '{}' now at {} today", key, n);
+    }
+
+    // Record that a comment was made
+    memory::record_comment();
+
     // Emit structured commentary to frontend
-    app.emit("sheep-commentary", &event)?;
+    app.emit("sheep-commentary", &parsed.event)?;
     eprintln!("[co-sheep] Commentary emitted to frontend");
 
-    // Log to journal
+    // Log to daily journal
     memory::append_journal(&format!(
         "{}\n**Comment**: {} [animation: {:?}]",
-        classification.summary, event.text, event.animation
+        classification.summary, parsed.event.text, parsed.event.animation
     ))
     .ok();
 
     Ok(())
 }
 
-/// Parse the Sonnet response as JSON {text, animation}, falling back to plain text.
-fn parse_commentary_response(raw: &str) -> CommentaryEvent {
+struct ParsedResponse {
+    event: CommentaryEvent,
+    opinion_topic: Option<String>,
+    opinion: Option<String>,
+    opinion_category: Option<String>,
+    count: Option<String>,
+}
+
+/// Parse the Sonnet response as JSON {text, animation, memory}, falling back to plain text.
+fn parse_commentary_response(raw: &str) -> ParsedResponse {
     let trimmed = raw
         .trim()
         .trim_start_matches("```json")
@@ -211,15 +251,27 @@ fn parse_commentary_response(raw: &str) -> CommentaryEvent {
         let animation = parsed
             .animation
             .filter(|a| valid_animations.contains(&a.as_str()));
-        CommentaryEvent {
-            text: parsed.text,
-            animation,
+        ParsedResponse {
+            event: CommentaryEvent {
+                text: parsed.text,
+                animation,
+            },
+            opinion_topic: parsed.opinion_topic,
+            opinion: parsed.opinion,
+            opinion_category: parsed.opinion_category,
+            count: parsed.count,
         }
     } else {
         eprintln!("[co-sheep] Failed to parse as JSON, using raw text");
-        CommentaryEvent {
-            text: raw.trim().to_string(),
-            animation: None,
+        ParsedResponse {
+            event: CommentaryEvent {
+                text: raw.trim().to_string(),
+                animation: None,
+            },
+            opinion_topic: None,
+            opinion: None,
+            opinion_category: None,
+            count: None,
         }
     }
 }

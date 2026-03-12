@@ -96,10 +96,11 @@ export class Sheep {
   /** Called when the user releases the sheep. Parachutes if airborne. */
   release() {
     if (this.y < this.groundY - 10) {
-      // Airborne — deploy parachute!
+      // Airborne — deploy parachute
       this.state = "parachute";
       this.stateTimer = 0;
       this.vy = 0;
+      this.vx = 0;
       const sprite = this.sprites["parachute"];
       if (sprite) sprite.reset();
     } else {
@@ -109,6 +110,42 @@ export class Sheep {
       this.stateTimer = 0;
       this.stateDuration = 1000 + Math.random() * 2000;
     }
+  }
+
+  /** Start petting — called when cursor hovers over sheep for a while. */
+  startPetting() {
+    if (this.state === "grabbed" || this.state === "parachute") return;
+    if (this.state === "petting") return;
+    console.log("[co-sheep] Being petted!");
+    this.setState("petting", 0);
+  }
+
+  /** Stop petting — called when cursor leaves. */
+  stopPetting() {
+    if (this.state !== "petting") return;
+    console.log("[co-sheep] Petting stopped");
+    this.setState("idle", 2000 + Math.random() * 3000);
+  }
+
+  /** Returns a random quip for double-click interaction. */
+  getRandomQuip(): string {
+    const quips = [
+      "Hey! Hooves are sensitive!",
+      "Do I come to YOUR desktop and poke you?",
+      "Baaaa! That tickles!",
+      "*startled sheep noises*",
+      "I was THINKING. Very deep thoughts.",
+      "You know I can see your tabs, right?",
+      "Stop poking me and get back to work.",
+      "Is this what passes for entertainment?",
+      "I'm not a button. I'm a sheep.",
+      "If you pet me one more time I'm filing an HR complaint.",
+      "Wow, procrastinating by clicking on a sheep. New low.",
+      "I'm judging you. Always judging.",
+      "That's my personal space!",
+      "Ow! Just kidding, I'm made of pixels.",
+    ];
+    return quips[Math.floor(Math.random() * quips.length)];
   }
 
   /** Hit-test: is point (px, py) over the sheep? Uses a generous hitbox. */
@@ -152,6 +189,9 @@ export class Sheep {
       case "grabbed":
         this.x = Math.max(0, Math.min(this.x, this.screenWidth - DISPLAY_SIZE));
         this.y = Math.max(0, Math.min(this.y, this.screenHeight - DISPLAY_SIZE));
+        break;
+      case "petting":
+        // Just chill — sprite animation handles the rest
         break;
       case "bounce":
         this.updateBounce(dt);
@@ -252,6 +292,7 @@ export class Sheep {
   private getSpriteKey(): string {
     switch (this.state) {
       case "grabbed": return "fall";
+      case "petting": return "sleep";
       case "bounce": return "idle";
       case "spin": return "walk";
       case "backflip": return "fall";
@@ -315,6 +356,18 @@ export class Sheep {
         ctx.save();
         ctx.translate(cx, cy);
         ctx.rotate(wiggle);
+        ctx.translate(-cx, -cy);
+        sprite.draw(ctx, this.x, this.y, SCALE, !this.facingRight);
+        ctx.restore();
+        break;
+      }
+
+      case "petting": {
+        // Gentle happy sway
+        const sway = Math.sin(this.stateTimer / 300) * 0.05;
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(sway);
         ctx.translate(-cx, -cy);
         sprite.draw(ctx, this.x, this.y, SCALE, !this.facingRight);
         ctx.restore();
@@ -409,6 +462,22 @@ export class Sheep {
   private drawEmoteParticles(ctx: CanvasRenderingContext2D) {
     const cx = this.x + DISPLAY_SIZE / 2;
     const top = this.y - 10;
+
+    if (this.state === "petting") {
+      // Floating hearts
+      ctx.save();
+      ctx.font = "14px serif";
+      const t = this.stateTimer / 600;
+      const heartCount = 3;
+      for (let i = 0; i < heartCount; i++) {
+        const phase = t + i * 2.1;
+        const hx = cx + Math.sin(phase * 1.5) * 25 - 8;
+        const hy = top - (phase % 3) * 20;
+        ctx.globalAlpha = 1 - (phase % 3) / 3;
+        ctx.fillText("\u{2764}\u{FE0F}", hx, hy);
+      }
+      ctx.restore();
+    }
 
     if (this.state === "bounce" && this.vy < -50) {
       // Sparkles on upward bounce

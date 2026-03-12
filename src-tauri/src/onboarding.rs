@@ -2,11 +2,31 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SheepConfig {
     pub name: String,
     pub personality: String,
     pub interval_secs: u64,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_language")]
+    pub language: String,
+}
+
+fn default_language() -> String {
+    "nynorsk".to_string()
+}
+
+impl Default for SheepConfig {
+    fn default() -> Self {
+        Self {
+            name: "Sheep".to_string(),
+            personality: "snarky".to_string(),
+            interval_secs: 150,
+            api_key: String::new(),
+            language: "nynorsk".to_string(),
+        }
+    }
 }
 
 fn config_path() -> PathBuf {
@@ -19,27 +39,62 @@ pub fn needs_onboarding() -> Result<bool, Box<dyn std::error::Error>> {
 }
 
 pub fn save_config(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let config = SheepConfig {
-        name: name.to_string(),
-        personality: "snarky".to_string(),
-        interval_secs: 150,
-    };
+    // Preserve existing config if it exists, just update the name
+    let mut config = load_config().unwrap_or_default();
+    config.name = name.to_string();
 
+    write_config(&config)
+}
+
+pub fn load_config() -> Option<SheepConfig> {
+    let path = config_path();
+    if !path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+pub fn write_config(config: &SheepConfig) -> Result<(), Box<dyn std::error::Error>> {
     let dir = config_path().parent().unwrap().to_path_buf();
     fs::create_dir_all(&dir)?;
 
-    let json = serde_json::to_string_pretty(&config)?;
+    let json = serde_json::to_string_pretty(config)?;
     fs::write(config_path(), json)?;
 
     Ok(())
 }
 
 pub fn get_sheep_name() -> Option<String> {
-    let path = config_path();
-    if !path.exists() {
-        return None;
+    load_config().map(|c| c.name)
+}
+
+/// Returns API key from config, falling back to env var.
+pub fn get_api_key() -> Option<String> {
+    // Config takes priority
+    if let Some(config) = load_config() {
+        if !config.api_key.is_empty() {
+            return Some(config.api_key);
+        }
     }
-    let content = fs::read_to_string(path).ok()?;
-    let config: SheepConfig = serde_json::from_str(&content).ok()?;
-    Some(config.name)
+    // Fall back to env var
+    std::env::var("ANTHROPIC_API_KEY").ok()
+}
+
+pub fn get_interval_secs() -> u64 {
+    load_config()
+        .map(|c| c.interval_secs)
+        .unwrap_or(150)
+}
+
+pub fn get_personality() -> String {
+    load_config()
+        .map(|c| c.personality)
+        .unwrap_or_else(|| "snarky".to_string())
+}
+
+pub fn get_language() -> String {
+    load_config()
+        .map(|c| c.language)
+        .unwrap_or_else(|| "nynorsk".to_string())
 }

@@ -11,6 +11,7 @@ export type SheepState =
   | "sleep"
   | "fall"
   | "grabbed"
+  | "petting"
   | "bounce"
   | "spin"
   | "backflip"
