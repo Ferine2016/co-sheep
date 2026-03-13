@@ -71,6 +71,24 @@ fn record_interaction(interaction: String) {
 }
 
 #[tauri::command]
+async fn debug_capture(app: tauri::AppHandle) -> Result<String, String> {
+    eprintln!("[co-sheep] Debug capture requested");
+    match tokio::task::spawn_blocking(|| capture::save_debug_screenshot()).await {
+        Ok(Ok(path)) => {
+            app.emit("sheep-commentary", "Saved what I see to your Desktop! Check co-sheep-debug-capture.png")
+                .ok();
+            Ok(path)
+        }
+        Ok(Err(e)) => {
+            let msg = format!("Capture failed: {}", e);
+            app.emit("sheep-commentary", &msg).ok();
+            Err(msg)
+        }
+        Err(e) => Err(format!("Task panicked: {}", e)),
+    }
+}
+
+#[tauri::command]
 async fn get_memory() -> Result<serde_json::Value, String> {
     Ok(memory::get_brain_for_display())
 }
@@ -202,6 +220,7 @@ pub fn run() {
             get_memory,
             open_memory_window,
             record_interaction,
+            debug_capture,
         ])
         .setup(|app| {
             eprintln!("[co-sheep] === co-sheep starting ===");
@@ -318,6 +337,13 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            let app_menu_debug = tauri::menu::MenuItem::with_id(
+                app,
+                "menu_debug_capture",
+                "Debug Capture...",
+                true,
+                None::<&str>,
+            )?;
             let app_menu_quit = tauri::menu::MenuItem::with_id(
                 app,
                 "menu_quit",
@@ -329,7 +355,7 @@ pub fn run() {
                 app,
                 "co-sheep",
                 true,
-                &[&app_menu_settings, &app_menu_memory, &app_menu_pause, &app_menu_quit],
+                &[&app_menu_settings, &app_menu_memory, &app_menu_pause, &app_menu_debug, &app_menu_quit],
             )?;
             let app_menu = tauri::menu::Menu::with_items(app, &[&app_submenu])?;
             app.set_menu(app_menu)?;
@@ -354,6 +380,14 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             if let Err(e) = open_memory_window(handle).await {
                                 eprintln!("[co-sheep] Failed to open memory: {}", e);
+                            }
+                        });
+                    }
+                    "menu_debug_capture" => {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = debug_capture(handle).await {
+                                eprintln!("[co-sheep] Debug capture failed: {}", e);
                             }
                         });
                     }

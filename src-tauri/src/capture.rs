@@ -44,3 +44,22 @@ pub fn capture_screen() -> Result<String, Box<dyn std::error::Error + Send + Syn
     eprintln!("[co-sheep] Base64 encoded: {} chars", b64.len());
     Ok(b64)
 }
+
+/// Save a debug screenshot to ~/Desktop so the user can verify what the sheep sees.
+pub fn save_debug_screenshot() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let monitors = Monitor::all()?;
+    let monitor = monitors.into_iter().next().ok_or("No monitor found")?;
+    let screenshot = monitor.capture_image()?;
+
+    let path = dirs::home_dir()
+        .expect("No home dir")
+        .join("Desktop")
+        .join("co-sheep-debug-capture.png");
+
+    let dynamic = DynamicImage::ImageRgba8(screenshot);
+    dynamic.save(&path)?;
+
+    let path_str = path.to_string_lossy().to_string();
+    eprintln!("[co-sheep] Debug screenshot saved to: {}", path_str);
+    Ok(path_str)
+}
