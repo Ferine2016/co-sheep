@@ -1,28 +1,39 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Sheep } from "./sheep";
-import { SpeechBubble } from "./speech-bubble";
+import { Flock } from "./flock";
+import { InputBubble } from "./input-bubble";
+import { BreakReminder } from "./break-reminder";
+import { createCompositeOverlay } from "./accessories";
+import { FriendConfig } from "./types";
 import "./styles.css";
 
-let sheep: Sheep;
-let speechBubble: SpeechBubble;
+let flock: Flock;
 let canvas: HTMLCanvasElement;
 let ctx: CanvasRenderingContext2D;
 let lastTime = 0;
 
 // Drag state
 let isDragging = false;
+let dragTarget: Sheep | null = null;
 let dragOffsetX = 0;
 let dragOffsetY = 0;
 
 // Petting state
+let hoverTarget: Sheep | null = null;
 let hoverTimer = 0;
-let isHovering = false;
 const PET_THRESHOLD = 2000; // ms of hovering before petting starts
+
+// Chat input bubble
+let chatBubble: InputBubble | null = null;
 
 // Throttle bounds updates to Rust (~20fps)
 let lastBoundsUpdate = 0;
 const BOUNDS_UPDATE_INTERVAL = 50;
+
+// Break reminders
+const breakReminder = new BreakReminder();
+let personality = "snarky";
 
 async function init() {
   canvas = document.getElementById("sheep-canvas") as HTMLCanvasElement;
@@ -34,40 +45,71 @@ async function init() {
 
   console.log("[co-sheep] Canvas initialized:", canvas.width, "x", canvas.height);
 
-  sheep = new Sheep(canvas.width, canvas.height);
-  speechBubble = new SpeechBubble();
-  speechBubble.onAnimation = (anim) => {
-    console.log("[co-sheep] Triggering animation from AI:", anim);
-    sheep.playAnimation(anim);
-  };
-  console.log("[co-sheep] Sheep and speech bubble created");
+  flock = new Flock(canvas.width, canvas.height);
+  console.log("[co-sheep] Flock created with main sheep + Good Colleague");
+
+  // Load settings (personality, break reminders, accessories)
+  try {
+    const settings = await invoke<{
+      personality: string;
+      break_reminders: boolean;
+      accessories: string[];
+    }>("get_settings");
+    personality = settings.personality || "snarky";
+    breakReminder.setEnabled(settings.break_reminders);
+    if (settings.accessories && settings.accessories.length > 0) {
+      flock.main.drawOverlay = createCompositeOverlay(settings.accessories);
+    }
+  } catch (e) {
+    console.log("[co-sheep] Failed to load settings:", e);
+  }
+
+  // Load additional saved friends
+  try {
+    const friends = await invoke<FriendConfig[]>("get_friends");
+    for (const f of friends) {
+      flock.addFriend(f);
+    }
+  } catch (e) {
+    console.log("[co-sheep] No saved friends to load:", e);
+  }
+
+  // --- Weather polling ---
+  pollWeather();
+  setInterval(pollWeather, 5 * 60 * 1000); // every 5 min
 
   // --- Drag, toss, double-click, and petting handlers ---
 
   document.addEventListener("mousedown", (e) => {
-    if (sheep.hitTest(e.clientX, e.clientY)) {
-      console.log("[co-sheep] Grab! at", e.clientX, e.clientY);
+    const target = flock.hitTest(e.clientX, e.clientY);
+    if (target) {
+      console.log(`[co-sheep] Grab ${target.id} at`, e.clientX, e.clientY);
       isDragging = true;
-      dragOffsetX = e.clientX - sheep.x;
-      dragOffsetY = e.clientY - sheep.y;
-      sheep.grab();
+      dragTarget = target;
+      dragOffsetX = e.clientX - target.x;
+      dragOffsetY = e.clientY - target.y;
+      // Clear petting state so hearts don't resume after release
+      hoverTarget = null;
+      hoverTimer = 0;
+      target.grab();
       document.body.classList.add("dragging");
       invoke("set_dragging", { dragging: true });
     }
   });
 
   document.addEventListener("mousemove", (e) => {
-    if (isDragging) {
-      sheep.x = e.clientX - dragOffsetX;
-      sheep.y = e.clientY - dragOffsetY;
+    if (isDragging && dragTarget) {
+      dragTarget.x = e.clientX - dragOffsetX;
+      dragTarget.y = e.clientY - dragOffsetY;
     }
   });
 
   document.addEventListener("mouseup", () => {
-    if (isDragging) {
-      console.log("[co-sheep] Release!");
+    if (isDragging && dragTarget) {
+      console.log(`[co-sheep] Release ${dragTarget.id}!`);
       isDragging = false;
-      sheep.release();
+      dragTarget.release();
+      dragTarget = null;
       document.body.classList.remove("dragging");
       invoke("set_dragging", { dragging: false });
     }
@@ -75,42 +117,51 @@ async function init() {
 
   // Double-click: random quip + animation
   document.addEventListener("dblclick", (e) => {
-    if (sheep.hitTest(e.clientX, e.clientY) && !isDragging) {
-      console.log("[co-sheep] Double-click!");
-      const quip = sheep.getRandomQuip();
-      speechBubble.show(quip, 4000);
+    const target = flock.hitTest(e.clientX, e.clientY);
+    if (target && !isDragging) {
+      console.log(`[co-sheep] Double-click ${target.id}!`);
+      target.resetActivity();
+      const quip = flock.getQuip(target);
+      const bubble = flock.getBubble(target);
+      bubble.show(quip, 4000);
       const anims: Array<"bounce" | "spin" | "headshake" | "vibrate"> = [
         "bounce", "spin", "headshake", "vibrate",
       ];
-      sheep.playAnimation(anims[Math.floor(Math.random() * anims.length)]);
-      invoke("record_interaction", { interaction: "poked" });
+      target.playAnimation(anims[Math.floor(Math.random() * anims.length)]);
+      invoke("record_interaction", { interaction: `poked ${target.id}` });
     }
   });
 
-  // Petting: track hover time over sheep
+  // Petting: track hover time over any sheep
   document.addEventListener("mousemove", (e) => {
     if (isDragging) return;
-    if (sheep.hitTest(e.clientX, e.clientY)) {
-      if (!isHovering) {
-        isHovering = true;
+    const target = flock.hitTest(e.clientX, e.clientY);
+    if (target) {
+      if (hoverTarget !== target) {
+        // Started hovering a new target
+        hoverTarget = target;
         hoverTimer = performance.now();
       } else if (
         performance.now() - hoverTimer > PET_THRESHOLD &&
-        sheep.state !== "petting"
+        target.state !== "petting"
       ) {
-        sheep.startPetting();
-        speechBubble.show("Zzzz... don't stop...", 3000);
-        invoke("record_interaction", { interaction: "petted" });
+        target.startPetting();
+        const bubble = flock.getBubble(target);
+        bubble.show("Zzzz... don't stop...", 3000);
+        invoke("record_interaction", { interaction: `petted ${target.id}` });
+        if (target.id !== "main") {
+          invoke("record_friend_pet", { id: target.id }).catch(() => {});
+        }
       }
     } else {
-      if (isHovering) {
-        isHovering = false;
-        sheep.stopPetting();
+      if (hoverTarget) {
+        hoverTarget.stopPetting();
+        hoverTarget = null;
       }
     }
   });
 
-  // File drop: sheep "eats" the file and comments
+  // File drop: any character can "eat" the file
   document.addEventListener("dragover", (e) => {
     e.preventDefault();
   });
@@ -119,28 +170,78 @@ async function init() {
     e.preventDefault();
     if (!e.dataTransfer?.files.length) return;
     const file = e.dataTransfer.files[0];
-    console.log("[co-sheep] File dropped:", file.name, file.type);
+    // Check if dropped on a specific character, default to main sheep
+    const target = flock.hitTest(e.clientX, e.clientY) ?? flock.main;
+    const bubble = flock.getBubble(target);
+    console.log(`[co-sheep] File dropped on ${target.id}:`, file.name, file.type);
+    target.resetActivity();
     const comment = getFileComment(file);
-    speechBubble.show(comment, 5000);
-    sheep.playAnimation("bounce");
-    invoke("record_interaction", { interaction: "fed a file" });
+    bubble.show(comment, 5000);
+    target.playAnimation("bounce");
+    invoke("record_interaction", { interaction: `fed a file to ${target.id}` });
+  });
+
+  // --- Right-click: open chat with main sheep ---
+  document.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    const target = flock.hitTest(e.clientX, e.clientY);
+    if (target && target.id === "main") {
+      openChat();
+    }
   });
 
   // --- Events ---
+  listen("open-chat", () => {
+    openChat();
+  });
+
   listen<string>("naming-complete", async (event) => {
     const name = event.payload;
     console.log("[co-sheep] Naming complete:", name);
     const hasKey = await invoke<boolean>("check_api_key");
     if (hasKey) {
-      speechBubble.show(
+      flock.mainBubble.show(
         `Nice! I'm ${name} now. I can see everything. This is going to be fun. For me.`,
         6000,
       );
     } else {
-      speechBubble.show(
+      flock.mainBubble.show(
         `I'm ${name}! But I can't see your screen yet. Set ANTHROPIC_API_KEY in your environment and restart me!`,
         8000,
       );
+    }
+  });
+
+  // Friend management events
+  listen<FriendConfig>("add-friend", (event) => {
+    flock.addFriend(event.payload);
+  });
+
+  listen<string>("remove-friend", (event) => {
+    flock.removeFriend(event.payload);
+  });
+
+  // Capture moment event
+  listen("capture-moment", () => {
+    captureMoment();
+  });
+
+  // Accessories changed event (main sheep)
+  listen("accessories-changed", async () => {
+    try {
+      const ids = await invoke<string[]>("get_accessories");
+      flock.main.drawOverlay = createCompositeOverlay(ids);
+    } catch (e) {
+      console.error("[co-sheep] Failed to reload accessories:", e);
+    }
+  });
+
+  // Friend accessories changed event
+  listen<{ id: string; accessories: string[] }>("friend-accessories-changed", (event) => {
+    const { id, accessories } = event.payload;
+    const entry = flock.getFriendEntry(id);
+    if (entry) {
+      entry.sheep.drawOverlay = createCompositeOverlay(accessories);
     }
   });
 
@@ -163,6 +264,146 @@ async function init() {
   requestAnimationFrame(gameLoop);
 }
 
+async function pollWeather() {
+  try {
+    const condition = await invoke<string | null>("get_weather_condition");
+    flock.setWeatherCondition(condition);
+  } catch (e) {
+    console.log("[co-sheep] Weather poll failed:", e);
+  }
+}
+
+async function captureMoment() {
+  const sheep = flock.main;
+  const size = sheep.displaySize;
+  const padding = 20;
+  const bubbleText = flock.mainBubble.currentText;
+  const bubbleHeight = bubbleText ? 60 : 0;
+  const totalW = size + padding * 2;
+  const totalH = size + padding * 2 + bubbleHeight;
+
+  const offscreen = document.createElement("canvas");
+  offscreen.width = totalW;
+  offscreen.height = totalH;
+  const offCtx = offscreen.getContext("2d")!;
+  offCtx.imageSmoothingEnabled = false;
+
+  // Draw sheep centered on offscreen canvas
+  const origX = sheep.x;
+  const origY = sheep.y;
+  sheep.x = padding;
+  sheep.y = padding + bubbleHeight;
+  sheep.draw(offCtx);
+  sheep.x = origX;
+  sheep.y = origY;
+
+  // Draw speech bubble if text is visible
+  if (bubbleText) {
+    drawBubbleShape(offCtx, totalW / 2, padding + bubbleHeight - 5, bubbleText);
+  }
+
+  const imageData = offscreen.toDataURL("image/png");
+  try {
+    await invoke("save_moment", { imageData });
+    flock.mainBubble.show("Moment captured! Saved to your Desktop.", 5000);
+  } catch (e) {
+    console.error("[co-sheep] Capture failed:", e);
+    flock.mainBubble.show("Capture failed... baaad luck.", 4000);
+  }
+}
+
+function drawBubbleShape(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  bottomY: number,
+  text: string,
+) {
+  ctx.save();
+  ctx.font = "12px 'Courier New', monospace";
+
+  // Wrap text
+  const maxLineW = 180;
+  const words = text.split(" ");
+  const lines: string[] = [];
+  let currentLine = "";
+  for (const word of words) {
+    const test = currentLine ? currentLine + " " + word : word;
+    if (ctx.measureText(test).width > maxLineW) {
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+    } else {
+      currentLine = test;
+    }
+  }
+  if (currentLine) lines.push(currentLine);
+
+  const lineH = 16;
+  const padX = 10;
+  const padY = 8;
+  const bubbleW = Math.min(maxLineW + padX * 2, 200);
+  const bubbleH = lines.length * lineH + padY * 2;
+  const bubbleX = cx - bubbleW / 2;
+  const bubbleY = bottomY - bubbleH - 8;
+
+  // Background
+  ctx.fillStyle = "#1a1a2e";
+  ctx.strokeStyle = "#e94560";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(bubbleX, bubbleY, bubbleW, bubbleH, 6);
+  ctx.fill();
+  ctx.stroke();
+
+  // Tail
+  ctx.fillStyle = "#1a1a2e";
+  ctx.beginPath();
+  ctx.moveTo(cx - 6, bubbleY + bubbleH);
+  ctx.lineTo(cx, bubbleY + bubbleH + 8);
+  ctx.lineTo(cx + 6, bubbleY + bubbleH);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = "#e94560";
+  ctx.beginPath();
+  ctx.moveTo(cx - 6, bubbleY + bubbleH);
+  ctx.lineTo(cx, bubbleY + bubbleH + 8);
+  ctx.lineTo(cx + 6, bubbleY + bubbleH);
+  ctx.stroke();
+
+  // Text
+  ctx.fillStyle = "#eee";
+  for (let i = 0; i < lines.length; i++) {
+    ctx.fillText(lines[i], bubbleX + padX, bubbleY + padY + (i + 1) * lineH - 3);
+  }
+  ctx.restore();
+}
+
+function openChat() {
+  if (chatBubble) return; // already open
+
+  chatBubble = new InputBubble({
+    promptText: "Talk to me...",
+    placeholder: "Say something...",
+    buttonText: "Send",
+    onSubmit: async (text) => {
+      chatBubble?.setLoading(true);
+      try {
+        await invoke("chat_with_sheep", { message: text });
+        // Response arrives via sheep-commentary event on mainBubble
+      } catch (e) {
+        console.error("[co-sheep] Chat error:", e);
+      }
+      chatBubble?.destroy();
+      chatBubble = null;
+    },
+    onClose: () => {
+      chatBubble?.destroy();
+      chatBubble = null;
+    },
+  });
+  chatBubble.show();
+  chatBubble.updatePosition(flock.main.x, flock.main.y, flock.main.displaySize);
+}
+
 function gameLoop(timestamp: number) {
   const dt = lastTime ? timestamp - lastTime : 16;
   lastTime = timestamp;
@@ -170,21 +411,31 @@ function gameLoop(timestamp: number) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.imageSmoothingEnabled = false;
 
-  sheep.update(dt);
-  sheep.draw(ctx);
+  flock.update(dt);
+  flock.draw(ctx);
 
-  speechBubble.updatePosition(sheep.x, sheep.y, sheep.displaySize);
+  // Break reminder check
+  breakReminder.update(
+    dt,
+    flock.main.state,
+    flock.mainBubble,
+    personality,
+    (anim) => {
+      flock.main.playAnimation(anim);
+      flock.echoBreakReminder();
+    },
+  );
 
-  // Report sheep bounds to Rust for cursor hit detection (throttled)
+  // Update chat bubble position if active
+  if (chatBubble) {
+    chatBubble.updatePosition(flock.main.x, flock.main.y, flock.main.displaySize);
+  }
+
+  // Report ALL bounds to Rust for cursor hit detection (throttled)
   if (timestamp - lastBoundsUpdate > BOUNDS_UPDATE_INTERVAL) {
     lastBoundsUpdate = timestamp;
-    const pad = 12;
-    invoke("update_sheep_bounds", {
-      x: sheep.x - pad,
-      y: sheep.y - pad,
-      w: sheep.displaySize + pad * 2,
-      h: sheep.displaySize + pad * 2,
-    });
+    const bounds = flock.getAllBounds();
+    invoke("update_sheep_bounds_multi", { bounds });
   }
 
   requestAnimationFrame(gameLoop);
@@ -267,6 +518,8 @@ function getFileComment(file: File): string {
 window.addEventListener("resize", () => {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
+  ctx.imageSmoothingEnabled = false;
+  flock.updateScreenSize(canvas.width, canvas.height);
 });
 
 init();

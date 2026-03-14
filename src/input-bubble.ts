@@ -1,43 +1,59 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export interface InputBubbleConfig {
+  promptText: string;
+  placeholder: string;
+  buttonText: string;
+  onSubmit: (text: string) => Promise<void>;
+  onClose?: () => void;
+}
+
 export class InputBubble {
   private element: HTMLDivElement;
   private input: HTMLInputElement;
-  private onSubmit: ((name: string) => void) | null = null;
+  private button: HTMLButtonElement;
+  private promptEl: HTMLDivElement;
+  private config: InputBubbleConfig;
 
-  constructor() {
+  constructor(config: InputBubbleConfig) {
+    this.config = config;
+
     this.element = document.createElement("div");
     this.element.className = "speech-bubble input-bubble";
     this.element.style.display = "none";
 
-    const prompt = document.createElement("div");
-    prompt.className = "speech-bubble-text";
-    prompt.textContent =
-      "Baaaa! I just landed on your desktop! What's my name?";
-    this.element.appendChild(prompt);
+    this.promptEl = document.createElement("div");
+    this.promptEl.className = "speech-bubble-text";
+    this.promptEl.textContent = config.promptText;
+    this.element.appendChild(this.promptEl);
 
     const form = document.createElement("form");
     form.className = "input-bubble-form";
 
     this.input = document.createElement("input");
     this.input.type = "text";
-    this.input.placeholder = "Name your sheep...";
+    this.input.placeholder = config.placeholder;
     this.input.className = "input-bubble-input";
     form.appendChild(this.input);
 
-    const button = document.createElement("button");
-    button.type = "submit";
-    button.textContent = "OK";
-    button.className = "input-bubble-button";
-    form.appendChild(button);
+    this.button = document.createElement("button");
+    this.button.type = "submit";
+    this.button.textContent = config.buttonText;
+    this.button.className = "input-bubble-button";
+    form.appendChild(this.button);
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
-      const name = this.input.value.trim();
-      if (name) {
-        await invoke("save_sheep_name", { name });
-        this.hide();
-        if (this.onSubmit) this.onSubmit(name);
+      const text = this.input.value.trim();
+      if (text) {
+        this.input.value = "";
+        await this.config.onSubmit(text);
+      }
+    });
+
+    this.input.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        this.config.onClose?.();
       }
     });
 
@@ -45,30 +61,44 @@ export class InputBubble {
     document.body.appendChild(this.element);
   }
 
-  async show(onSubmit: (name: string) => void) {
-    this.onSubmit = onSubmit;
+  show() {
     this.element.style.display = "block";
-
-    // Disable click-through so user can type
-    await invoke("set_cursor_events", { ignore: false });
-
-    // Focus input
+    invoke("set_cursor_events", { ignore: false });
     setTimeout(() => this.input.focus(), 100);
   }
 
-  async hide() {
+  hide() {
     this.element.style.display = "none";
+    invoke("set_cursor_events", { ignore: true });
+  }
 
-    // Re-enable click-through
-    await invoke("set_cursor_events", { ignore: true });
+  destroy() {
+    this.hide();
+    this.element.remove();
+  }
+
+  setLoading(on: boolean) {
+    this.input.disabled = on;
+    this.button.disabled = on;
+    if (on) {
+      this.promptEl.textContent = "thinking...";
+      this.promptEl.classList.add("input-bubble-loading");
+    } else {
+      this.promptEl.textContent = this.config.promptText;
+      this.promptEl.classList.remove("input-bubble-loading");
+    }
   }
 
   updatePosition(sheepX: number, sheepY: number, sheepSize: number) {
-    // Position above the sheep, centered horizontally
     const bubbleX = sheepX + sheepSize / 2;
     const bubbleY = sheepY - 20;
 
-    this.element.style.left = `${bubbleX}px`;
-    this.element.style.bottom = `${window.innerHeight - bubbleY}px`;
+    const rect = this.element.getBoundingClientRect();
+    const halfW = rect.width / 2;
+    const clampedX = Math.max(halfW + 4, Math.min(bubbleX, window.innerWidth - halfW - 4));
+    const clampedBottom = Math.max(rect.height + 16, window.innerHeight - bubbleY);
+
+    this.element.style.left = `${clampedX}px`;
+    this.element.style.bottom = `${clampedBottom}px`;
   }
 }

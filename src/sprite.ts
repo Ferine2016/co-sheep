@@ -1,4 +1,8 @@
 export class SpriteSheet {
+  private static imageCache: Map<string, HTMLImageElement> = new Map();
+  private static tintCanvas: HTMLCanvasElement | null = null;
+  private static tintCtx: CanvasRenderingContext2D | null = null;
+
   private image: HTMLImageElement | null = null;
   private loaded = false;
   private frameWidth: number;
@@ -20,14 +24,25 @@ export class SpriteSheet {
     this.frameCount = frameCount;
     this.frameDuration = 1000 / fps;
 
-    this.image = new Image();
-    this.image.onload = () => {
-      this.loaded = true;
-    };
-    this.image.onerror = () => {
-      this.loaded = false;
-    };
-    this.image.src = src;
+    // Reuse cached image if available
+    const cached = SpriteSheet.imageCache.get(src);
+    if (cached) {
+      this.image = cached;
+      this.loaded = cached.complete && cached.naturalWidth > 0;
+      if (!this.loaded) {
+        cached.addEventListener("load", () => { this.loaded = true; }, { once: true });
+      }
+    } else {
+      this.image = new Image();
+      this.image.onload = () => {
+        this.loaded = true;
+      };
+      this.image.onerror = () => {
+        this.loaded = false;
+      };
+      this.image.src = src;
+      SpriteSheet.imageCache.set(src, this.image);
+    }
   }
 
   update(dt: number) {
@@ -44,6 +59,7 @@ export class SpriteSheet {
     y: number,
     scale: number,
     flipX: boolean = false,
+    tint?: string,
   ) {
     if (!this.loaded || !this.image) {
       // Fallback: draw a simple sheep shape
@@ -51,35 +67,52 @@ export class SpriteSheet {
       return;
     }
 
-    ctx.save();
-    if (flipX) {
-      ctx.translate(x + this.frameWidth * scale, y);
-      ctx.scale(-1, 1);
-      ctx.drawImage(
-        this.image,
-        this.currentFrame * this.frameWidth,
-        0,
-        this.frameWidth,
-        this.frameHeight,
-        0,
-        0,
-        this.frameWidth * scale,
-        this.frameHeight * scale,
+    const w = this.frameWidth * scale;
+    const h = this.frameHeight * scale;
+    const sx = this.currentFrame * this.frameWidth;
+
+    if (tint) {
+      // Use offscreen canvas so source-atop only affects the current sprite
+      if (!SpriteSheet.tintCanvas) {
+        SpriteSheet.tintCanvas = document.createElement("canvas");
+        SpriteSheet.tintCtx = SpriteSheet.tintCanvas.getContext("2d")!;
+      }
+      const tc = SpriteSheet.tintCanvas;
+      const tctx = SpriteSheet.tintCtx!;
+      if (tc.width !== w || tc.height !== h) {
+        tc.width = w;
+        tc.height = h;
+      } else {
+        tctx.clearRect(0, 0, w, h);
+      }
+
+      tctx.imageSmoothingEnabled = false;
+      tctx.globalCompositeOperation = "source-over";
+      tctx.drawImage(
+        this.image, sx, 0, this.frameWidth, this.frameHeight, 0, 0, w, h,
       );
+      tctx.globalCompositeOperation = "source-atop";
+      tctx.fillStyle = tint;
+      tctx.fillRect(0, 0, w, h);
+
+      ctx.save();
+      if (flipX) {
+        ctx.translate(x + w, y);
+        ctx.scale(-1, 1);
+      }
+      ctx.drawImage(tc, flipX ? 0 : x, flipX ? 0 : y);
+      ctx.restore();
     } else {
-      ctx.drawImage(
-        this.image,
-        this.currentFrame * this.frameWidth,
-        0,
-        this.frameWidth,
-        this.frameHeight,
-        x,
-        y,
-        this.frameWidth * scale,
-        this.frameHeight * scale,
-      );
+      ctx.save();
+      if (flipX) {
+        ctx.translate(x + w, y);
+        ctx.scale(-1, 1);
+        ctx.drawImage(this.image, sx, 0, this.frameWidth, this.frameHeight, 0, 0, w, h);
+      } else {
+        ctx.drawImage(this.image, sx, 0, this.frameWidth, this.frameHeight, x, y, w, h);
+      }
+      ctx.restore();
     }
-    ctx.restore();
   }
 
   private drawFallback(

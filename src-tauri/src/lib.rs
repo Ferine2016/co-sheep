@@ -1,12 +1,15 @@
 mod capture;
 mod cursor;
+mod friend_memory;
 mod memory;
 mod onboarding;
 mod permissions;
 mod personality;
 mod screen_info;
 mod vision;
+mod weather;
 
+use base64::Engine;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{Emitter, Manager};
 
@@ -131,12 +134,16 @@ async fn save_settings(
     ai_provider: String,
     lmstudio_endpoint: String,
     lmstudio_model: String,
+    break_reminders: bool,
+    weather_location: String,
 ) -> Result<(), String> {
     eprintln!(
         "[co-sheep] Saving settings: name={}, personality={}, interval={}s, language={}, provider={}, api_key={}",
         name, personality, interval_secs, language, ai_provider,
         if api_key.is_empty() { "(empty)" } else { "(set)" }
     );
+    // Preserve existing friends and accessories when saving settings
+    let existing = onboarding::load_config().unwrap_or_default();
     let config = onboarding::SheepConfig {
         name,
         personality,
@@ -146,6 +153,10 @@ async fn save_settings(
         ai_provider,
         lmstudio_endpoint,
         lmstudio_model,
+        friends: existing.friends,
+        break_reminders,
+        weather_location,
+        accessories: existing.accessories,
     };
     onboarding::write_config(&config).map_err(|e| e.to_string())
 }
@@ -178,16 +189,283 @@ async fn check_screen_permission() -> bool {
     permissions::has_screen_capture_permission()
 }
 
-/// Called by the frontend every ~50ms with the sheep's bounding box.
-#[tauri::command]
-fn update_sheep_bounds(
-    state: tauri::State<cursor::SheepHitState>,
+#[derive(serde::Deserialize)]
+struct BoundsRect {
     x: f64,
     y: f64,
     w: f64,
     h: f64,
+}
+
+/// Called by the frontend every ~50ms with all character bounding boxes.
+#[tauri::command]
+fn update_sheep_bounds_multi(
+    state: tauri::State<cursor::SheepHitState>,
+    bounds: Vec<BoundsRect>,
 ) {
-    *state.bounds.lock().unwrap() = (x, y, w, h);
+    let mut stored = state.bounds.lock().unwrap();
+    *stored = bounds.iter().map(|b| (b.x, b.y, b.w, b.h)).collect();
+}
+
+#[tauri::command]
+async fn get_friends() -> Result<Vec<onboarding::FriendDef>, String> {
+    let friends = onboarding::load_config()
+        .map(|c| c.friends)
+        .unwrap_or_default();
+    // Ensure friend brains are initialized (including Good Colleague)
+    friend_memory::ensure_brain("good_colleague", "Good Colleague");
+    for f in &friends {
+        friend_memory::ensure_brain(&f.id, &f.name);
+    }
+    friend_memory::decay_affinities(); // daily decay check
+    Ok(friends)
+}
+
+#[tauri::command]
+async fn add_friend(app: tauri::AppHandle, name: String, color: String, personality: String) -> Result<(), String> {
+    let mut config = onboarding::load_config().unwrap_or_default();
+    let id = format!(
+        "friend_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let scale = 0.85 + (rand_f64() * 0.3); // 0.85–1.15
+    let friend = onboarding::FriendDef {
+        id: id.clone(),
+        name: name.clone(),
+        color: color.clone(),
+        personality: personality.clone(),
+        accessories: Vec::new(),
+        scale,
+    };
+    config.friends.push(friend);
+    onboarding::write_config(&config).map_err(|e| e.to_string())?;
+    friend_memory::ensure_brain(&id, &name);
+    app.emit(
+        "add-friend",
+        serde_json::json!({ "id": id, "name": name, "color": color, "personality": personality, "scale": scale }),
+    )
+    .map_err(|e| e.to_string())?;
+    eprintln!("[co-sheep] Added friend: {} ({}, {})", name, color, personality);
+    Ok(())
+}
+
+fn rand_f64() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    (nanos as f64 % 1000.0) / 1000.0
+}
+
+#[tauri::command]
+async fn save_friend_accessories(app: tauri::AppHandle, id: String, accessories: Vec<String>) -> Result<(), String> {
+    let mut config = onboarding::load_config().unwrap_or_default();
+    if let Some(friend) = config.friends.iter_mut().find(|f| f.id == id) {
+        friend.accessories = accessories.clone();
+    }
+    onboarding::write_config(&config).map_err(|e| e.to_string())?;
+    app.emit("friend-accessories-changed", serde_json::json!({ "id": id, "accessories": accessories }))
+        .map_err(|e| e.to_string())?;
+    eprintln!("[co-sheep] Friend {} accessories saved", id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn remove_friend(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let mut config = onboarding::load_config().unwrap_or_default();
+    config.friends.retain(|f| f.id != id);
+    onboarding::write_config(&config).map_err(|e| e.to_string())?;
+    app.emit("remove-friend", &id)
+        .map_err(|e| e.to_string())?;
+    eprintln!("[co-sheep] Removed friend: {}", id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_friends_window(app: tauri::AppHandle) -> Result<(), String> {
+    eprintln!("[co-sheep] Opening friends window");
+    if let Some(win) = app.get_webview_window("friends") {
+        win.set_focus().ok();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "friends",
+        tauri::WebviewUrl::App("friends.html".into()),
+    )
+    .title("Manage Friends")
+    .inner_size(400.0, 550.0)
+    .center()
+    .decorations(true)
+    .always_on_top(true)
+    .resizable(false)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_cursor_events(
+    app: tauri::AppHandle,
+    state: tauri::State<cursor::SheepHitState>,
+    ignore: bool,
+) {
+    eprintln!("[co-sheep] set_cursor_events: ignore={}", ignore);
+    state.is_input_active.store(!ignore, Ordering::Relaxed);
+    if let Some(window) = app.get_webview_window("main") {
+        window.set_ignore_cursor_events(ignore).ok();
+    }
+}
+
+#[tauri::command]
+async fn chat_with_sheep(app: tauri::AppHandle, message: String) -> Result<String, String> {
+    eprintln!("[co-sheep] Chat request: {}", message);
+    match vision::chat_with_sheep(&app, &message).await {
+        Ok(event) => serde_json::to_string(&event).map_err(|e| e.to_string()),
+        Err(e) => {
+            let msg = format!("Chat failed: {}", e);
+            eprintln!("[co-sheep] {}", msg);
+            app.emit("sheep-commentary", "Baaaa... my brain isn't working right now. Try again?").ok();
+            Err(msg)
+        }
+    }
+}
+
+#[tauri::command]
+async fn save_moment(image_data: String) -> Result<String, String> {
+    let b64 = image_data
+        .strip_prefix("data:image/png;base64,")
+        .unwrap_or(&image_data);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("Base64 decode error: {}", e))?;
+
+    let home = dirs::home_dir().ok_or("No home directory")?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = home
+        .join("Desktop")
+        .join(format!("co-sheep-moment-{}.png", ts));
+    std::fs::write(&path, bytes).map_err(|e| format!("Write error: {}", e))?;
+    let p = path.to_string_lossy().to_string();
+    eprintln!("[co-sheep] Moment saved to {}", p);
+    Ok(p)
+}
+
+#[tauri::command]
+async fn get_weather_condition() -> Option<String> {
+    weather::get_weather_condition().await
+}
+
+#[tauri::command]
+async fn get_accessories() -> Vec<String> {
+    onboarding::load_config()
+        .map(|c| c.accessories)
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+async fn save_accessories(app: tauri::AppHandle, accessories: Vec<String>) -> Result<(), String> {
+    let mut config = onboarding::load_config().unwrap_or_default();
+    config.accessories = accessories;
+    onboarding::write_config(&config).map_err(|e| e.to_string())?;
+    app.emit("accessories-changed", ())
+        .map_err(|e| e.to_string())?;
+    eprintln!("[co-sheep] Accessories saved");
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_wardrobe_window(app: tauri::AppHandle) -> Result<(), String> {
+    eprintln!("[co-sheep] Opening wardrobe window");
+    if let Some(win) = app.get_webview_window("wardrobe") {
+        win.set_focus().ok();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "wardrobe",
+        tauri::WebviewUrl::App("wardrobe.html".into()),
+    )
+    .title("Wardrobe")
+    .inner_size(400.0, 580.0)
+    .center()
+    .decorations(true)
+    .always_on_top(true)
+    .resizable(false)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_friend_memory_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("friend_memory") {
+        win.set_focus().ok();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "friend_memory",
+        tauri::WebviewUrl::App("friend-memory.html".into()),
+    )
+    .title("Friend Relationships")
+    .inner_size(420.0, 500.0)
+    .center()
+    .decorations(true)
+    .always_on_top(true)
+    .resizable(true)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn record_friend_conversation(id_a: String, id_b: String, topic: String) {
+    friend_memory::record_conversation(&id_a, &id_b, &topic);
+}
+
+#[tauri::command]
+fn record_group_activity(participants: Vec<String>, activity_type: String) {
+    friend_memory::record_group_activity(&participants, &activity_type);
+}
+
+#[tauri::command]
+fn record_friend_pet(id: String) {
+    friend_memory::record_pet(&id);
+}
+
+#[tauri::command]
+async fn get_friend_memory(id: String) -> Result<serde_json::Value, String> {
+    Ok(friend_memory::get_friend_brain_json(&id))
+}
+
+#[tauri::command]
+async fn get_all_relationships() -> Result<serde_json::Value, String> {
+    Ok(friend_memory::get_all_relationships())
+}
+
+#[tauri::command]
+async fn get_friend_moods() -> Result<std::collections::HashMap<String, String>, String> {
+    Ok(friend_memory::get_all_moods())
+}
+
+#[tauri::command]
+async fn friend_ai_chat(
+    friend_a_name: String,
+    friend_a_personality: String,
+    friend_b_name: String,
+    friend_b_personality: String,
+) -> Result<String, String> {
+    eprintln!("[co-sheep] Friend AI chat: {} ({}) <-> {} ({})", friend_a_name, friend_a_personality, friend_b_name, friend_b_personality);
+    vision::friend_chat(&friend_a_name, &friend_a_personality, &friend_b_name, &friend_b_personality)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Called by the frontend on mousedown/mouseup to lock click-through off during drag.
@@ -218,8 +496,10 @@ pub fn run() {
             get_screen_info,
             check_api_key,
             check_screen_permission,
-            update_sheep_bounds,
+            update_sheep_bounds_multi,
             set_dragging,
+            set_cursor_events,
+            chat_with_sheep,
             get_settings,
             save_settings,
             open_settings_window,
@@ -227,6 +507,24 @@ pub fn run() {
             open_memory_window,
             record_interaction,
             debug_capture,
+            get_friends,
+            add_friend,
+            remove_friend,
+            open_friends_window,
+            save_moment,
+            get_weather_condition,
+            get_accessories,
+            save_accessories,
+            open_wardrobe_window,
+            save_friend_accessories,
+            friend_ai_chat,
+            record_friend_conversation,
+            record_group_activity,
+            record_friend_pet,
+            get_friend_memory,
+            get_all_relationships,
+            get_friend_moods,
+            open_friend_memory_window,
         ])
         .setup(|app| {
             eprintln!("[co-sheep] === co-sheep starting ===");
@@ -289,11 +587,39 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            let friends_item = tauri::menu::MenuItem::with_id(
+                app,
+                "friends",
+                "Manage Friends...",
+                true,
+                None::<&str>,
+            )?;
+            let chat_item = tauri::menu::MenuItem::with_id(
+                app,
+                "chat",
+                "Chat with Sheep...",
+                true,
+                None::<&str>,
+            )?;
+            let capture_moment_item = tauri::menu::MenuItem::with_id(
+                app,
+                "capture_moment",
+                "Capture Moment",
+                true,
+                None::<&str>,
+            )?;
+            let wardrobe_item = tauri::menu::MenuItem::with_id(
+                app,
+                "wardrobe",
+                "Wardrobe...",
+                true,
+                None::<&str>,
+            )?;
             let quit =
                 tauri::menu::MenuItem::with_id(app, "quit", "Quit co-sheep", true, None::<&str>)?;
 
             // Tray icon menu
-            let tray_menu = tauri::menu::Menu::with_items(app, &[&settings_item, &memory_item, &comment_now, &pause, &quit])?;
+            let tray_menu = tauri::menu::Menu::with_items(app, &[&settings_item, &memory_item, &friends_item, &wardrobe_item, &chat_item, &capture_moment_item, &comment_now, &pause, &quit])?;
 
             let _tray = tauri::tray::TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
@@ -332,6 +658,28 @@ pub fn run() {
                                 }
                             });
                         }
+                        "friends" => {
+                            let handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(e) = open_friends_window(handle).await {
+                                    eprintln!("[co-sheep] Failed to open friends: {}", e);
+                                }
+                            });
+                        }
+                        "chat" => {
+                            app.emit("open-chat", ()).ok();
+                        }
+                        "capture_moment" => {
+                            app.emit("capture-moment", ()).ok();
+                        }
+                        "wardrobe" => {
+                            let handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(e) = open_wardrobe_window(handle).await {
+                                    eprintln!("[co-sheep] Failed to open wardrobe: {}", e);
+                                }
+                            });
+                        }
                         _ => {}
                     }
                 })
@@ -366,10 +714,38 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            let app_menu_friends = tauri::menu::MenuItem::with_id(
+                app,
+                "menu_friends",
+                "Manage Friends...",
+                true,
+                None::<&str>,
+            )?;
+            let app_menu_chat = tauri::menu::MenuItem::with_id(
+                app,
+                "menu_chat",
+                "Chat with Sheep...",
+                true,
+                None::<&str>,
+            )?;
             let app_menu_debug = tauri::menu::MenuItem::with_id(
                 app,
                 "menu_debug_capture",
                 "Debug Capture...",
+                true,
+                None::<&str>,
+            )?;
+            let app_menu_capture_moment = tauri::menu::MenuItem::with_id(
+                app,
+                "menu_capture_moment",
+                "Capture Moment",
+                true,
+                None::<&str>,
+            )?;
+            let app_menu_wardrobe = tauri::menu::MenuItem::with_id(
+                app,
+                "menu_wardrobe",
+                "Wardrobe...",
                 true,
                 None::<&str>,
             )?;
@@ -384,7 +760,7 @@ pub fn run() {
                 app,
                 "co-sheep",
                 true,
-                &[&app_menu_settings, &app_menu_memory, &app_menu_comment_now, &app_menu_pause, &app_menu_debug, &app_menu_quit],
+                &[&app_menu_settings, &app_menu_memory, &app_menu_friends, &app_menu_wardrobe, &app_menu_chat, &app_menu_capture_moment, &app_menu_comment_now, &app_menu_pause, &app_menu_debug, &app_menu_quit],
             )?;
             let app_menu = tauri::menu::Menu::with_items(app, &[&app_submenu])?;
             app.set_menu(app_menu)?;
@@ -418,6 +794,28 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             if let Err(e) = open_memory_window(handle).await {
                                 eprintln!("[co-sheep] Failed to open memory: {}", e);
+                            }
+                        });
+                    }
+                    "menu_friends" => {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = open_friends_window(handle).await {
+                                eprintln!("[co-sheep] Failed to open friends: {}", e);
+                            }
+                        });
+                    }
+                    "menu_chat" => {
+                        app.emit("open-chat", ()).ok();
+                    }
+                    "menu_capture_moment" => {
+                        app.emit("capture-moment", ()).ok();
+                    }
+                    "menu_wardrobe" => {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = open_wardrobe_window(handle).await {
+                                eprintln!("[co-sheep] Failed to open wardrobe: {}", e);
                             }
                         });
                     }

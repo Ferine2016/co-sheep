@@ -34,7 +34,7 @@ struct SonnetResponse {
 }
 
 #[derive(serde::Serialize, Clone)]
-struct CommentaryEvent {
+pub(crate) struct CommentaryEvent {
     text: String,
     animation: Option<String>,
 }
@@ -385,7 +385,8 @@ async fn generate_commentary_anthropic(
     recent_journal: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
-    let system_prompt = personality::get_system_prompt(recent_journal);
+    let weather_ctx = crate::weather::get_weather_context().await;
+    let system_prompt = personality::get_system_prompt(recent_journal, &weather_ctx);
 
     let body = serde_json::json!({
         "model": "claude-sonnet-4-5-20250929",
@@ -494,7 +495,8 @@ async fn generate_commentary_openai(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     let url = format!("{}/v1/chat/completions", endpoint);
-    let system_prompt = personality::get_system_prompt(recent_journal);
+    let weather_ctx = crate::weather::get_weather_context().await;
+    let system_prompt = personality::get_system_prompt(recent_journal, &weather_ctx);
     let image_url = format!("data:image/jpeg;base64,{}", screenshot_b64);
 
     let body = serde_json::json!({
@@ -541,6 +543,168 @@ async fn generate_commentary_openai(
     let text = extract_openai_text(&resp_json)?;
 
     Ok(text.to_string())
+}
+
+// ─── Chat (text-only, for conversation mode) ────────────────────────────────
+
+pub async fn chat_with_sheep(
+    app: &tauri::AppHandle,
+    user_message: &str,
+) -> Result<CommentaryEvent, Box<dyn std::error::Error + Send + Sync>> {
+    let provider = get_provider().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let recent_context = memory::get_recent_context().unwrap_or_default();
+    let weather_ctx = crate::weather::get_weather_context().await;
+    let system_prompt = personality::get_chat_prompt(&recent_context, &weather_ctx);
+
+    let raw_response = match &provider {
+        AiProvider::Anthropic { api_key } => {
+            chat_anthropic(api_key, &system_prompt, user_message).await?
+        }
+        AiProvider::LmStudio { endpoint, model } => {
+            chat_openai(endpoint, model, &system_prompt, user_message).await?
+        }
+    };
+
+    eprintln!("[co-sheep] Chat raw response: {}", raw_response);
+    let parsed = parse_commentary_response(&raw_response);
+
+    // Save opinion if formed
+    if let (Some(ref topic), Some(ref opinion)) = (&parsed.opinion_topic, &parsed.opinion) {
+        let category = parsed.opinion_category.as_deref().unwrap_or("opinion");
+        memory::save_opinion(topic, opinion, category).ok();
+    }
+    if let Some(ref key) = parsed.count {
+        memory::increment_today(key);
+    }
+
+    memory::record_interaction("chatted with");
+    memory::append_journal(&format!(
+        "Human said: \"{}\"\n**Reply**: {} [animation: {:?}]",
+        user_message, parsed.event.text, parsed.event.animation
+    )).ok();
+
+    // Emit to frontend
+    app.emit("sheep-commentary", &parsed.event)?;
+
+    Ok(parsed.event)
+}
+
+async fn chat_anthropic(
+    api_key: &str,
+    system_prompt: &str,
+    user_message: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 256,
+        "system": system_prompt,
+        "messages": [{
+            "role": "user",
+            "content": user_message
+        }]
+    });
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(format!("Chat API error ({}): {}", status, body_text).into());
+    }
+
+    let resp_json: serde_json::Value = resp.json().await?;
+    let text = resp_json["content"][0]["text"]
+        .as_str()
+        .ok_or("No text in chat response")?
+        .to_string();
+    Ok(text)
+}
+
+async fn chat_openai(
+    endpoint: &str,
+    model: &str,
+    system_prompt: &str,
+    user_message: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/chat/completions", endpoint);
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": format!("{} /no_think", user_message) }
+        ]
+    });
+
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(format!("Chat LM Studio error ({}): {}", status, body_text).into());
+    }
+
+    let resp_json: serde_json::Value = resp.json().await?;
+    let text = extract_openai_text(&resp_json)?;
+    Ok(text.to_string())
+}
+
+// ─── Friend-to-friend AI chat ────────────────────────────────────────────────
+
+pub async fn friend_chat(
+    friend_a_name: &str,
+    friend_a_personality: &str,
+    friend_b_name: &str,
+    friend_b_personality: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let provider = get_provider().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let language = onboarding::get_language();
+
+    let system_prompt = format!(
+        r#"You are writing a short conversation between two desktop sheep friends.
+{a} is {pa}. {b} is {pb}.
+Write a 2-4 line exchange. Keep it SHORT, funny, and in character. They are pixel sheep living on someone's desktop.
+
+LANGUAGE: Write in {lang}.
+
+Reply with ONLY a JSON array, no markdown:
+[{{"speaker": "{a}", "text": "...", "animation": "bounce"}}, {{"speaker": "{b}", "text": "...", "animation": null}}]
+
+Valid animations: "bounce", "spin", "headshake", "vibrate", "zoom", null"#,
+        a = friend_a_name,
+        pa = friend_a_personality,
+        b = friend_b_name,
+        pb = friend_b_personality,
+        lang = language,
+    );
+
+    let user_msg = format!("Generate a conversation between {} and {}.", friend_a_name, friend_b_name);
+
+    let raw = match &provider {
+        AiProvider::Anthropic { api_key } => {
+            chat_anthropic(api_key, &system_prompt, &user_msg).await?
+        }
+        AiProvider::LmStudio { endpoint, model } => {
+            chat_openai(endpoint, model, &system_prompt, &user_msg).await?
+        }
+    };
+
+    eprintln!("[co-sheep] Friend chat raw: {}", raw);
+    Ok(raw)
 }
 
 // ─── Shared helpers ─────────────────────────────────────────────────────────

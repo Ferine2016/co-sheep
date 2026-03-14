@@ -7,14 +7,20 @@ export class SpeechBubble {
   private isVisible = false;
   private typewriterInterval: number | null = null;
   private hideTimeout: number | null = null;
+  private unlisten: (() => void) | null = null;
+  private lastText: string = "";
 
   /** Callback invoked when an animation should be triggered */
   onAnimation: ((anim: SheepAnimation) => void) | null = null;
 
-  constructor() {
+  constructor(listenToCommentary: boolean = true, borderColor?: string) {
     this.element = document.createElement("div");
     this.element.className = "speech-bubble";
     this.element.style.display = "none";
+    if (borderColor) {
+      this.element.style.borderColor = borderColor;
+      this.element.style.setProperty("--bubble-border-color", borderColor);
+    }
 
     this.textElement = document.createElement("div");
     this.textElement.className = "speech-bubble-text";
@@ -22,32 +28,45 @@ export class SpeechBubble {
 
     document.body.appendChild(this.element);
 
-    // Listen for structured commentary events from Rust backend
-    listen<CommentaryEvent | string>("sheep-commentary", (event) => {
-      const payload = event.payload;
+    if (listenToCommentary) {
+      // Listen for structured commentary events from Rust backend
+      listen<CommentaryEvent | string>("sheep-commentary", (event) => {
+        const payload = event.payload;
 
-      if (typeof payload === "string") {
-        // Legacy plain string (from permission/error messages)
-        console.log("[co-sheep] Speech bubble (plain):", payload);
-        this.show(payload, 8000);
-      } else {
-        // Structured event with text + animation
-        console.log(
-          "[co-sheep] Speech bubble:",
-          payload.text,
-          "animation:",
-          payload.animation,
-        );
-        this.show(payload.text, 8000);
-        if (payload.animation && this.onAnimation) {
-          this.onAnimation(payload.animation);
+        if (typeof payload === "string") {
+          // Legacy plain string (from permission/error messages)
+          console.log("[co-sheep] Speech bubble (plain):", payload);
+          this.show(payload, 8000);
+        } else {
+          // Structured event with text + animation
+          console.log(
+            "[co-sheep] Speech bubble:",
+            payload.text,
+            "animation:",
+            payload.animation,
+          );
+          this.show(payload.text, 8000);
+          if (payload.animation && this.onAnimation) {
+            this.onAnimation(payload.animation);
+          }
         }
-      }
-    });
+      }).then((fn) => {
+        this.unlisten = fn;
+      });
+    }
+  }
+
+  get visible(): boolean {
+    return this.isVisible;
+  }
+
+  get currentText(): string {
+    return this.isVisible ? this.lastText : "";
   }
 
   show(text: string, duration: number = 5000) {
     this.clear();
+    this.lastText = text;
     this.element.style.display = "block";
     this.isVisible = true;
     this.textElement.textContent = "";
@@ -78,6 +97,16 @@ export class SpeechBubble {
     this.isVisible = false;
   }
 
+  /** Remove the DOM element when this bubble is no longer needed. */
+  destroy() {
+    this.clear();
+    if (this.unlisten) {
+      this.unlisten();
+      this.unlisten = null;
+    }
+    this.element.remove();
+  }
+
   private clear() {
     if (this.typewriterInterval) {
       clearInterval(this.typewriterInterval);
@@ -96,7 +125,13 @@ export class SpeechBubble {
     const bubbleX = sheepX + sheepSize / 2;
     const bubbleY = sheepY - 20;
 
-    this.element.style.left = `${bubbleX}px`;
-    this.element.style.bottom = `${window.innerHeight - bubbleY}px`;
+    // Clamp to viewport edges so bubbles don't overflow
+    const rect = this.element.getBoundingClientRect();
+    const halfW = rect.width / 2;
+    const clampedX = Math.max(halfW + 4, Math.min(bubbleX, window.innerWidth - halfW - 4));
+    const clampedBottom = Math.max(rect.height + 16, window.innerHeight - bubbleY);
+
+    this.element.style.left = `${clampedX}px`;
+    this.element.style.bottom = `${clampedBottom}px`;
   }
 }

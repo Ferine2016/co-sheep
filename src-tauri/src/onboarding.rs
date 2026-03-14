@@ -3,6 +3,27 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone)]
+pub struct FriendDef {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    #[serde(default = "default_friend_personality")]
+    pub personality: String,
+    #[serde(default)]
+    pub accessories: Vec<String>,
+    #[serde(default = "default_friend_scale")]
+    pub scale: f64,
+}
+
+fn default_friend_personality() -> String {
+    "wholesome".to_string()
+}
+
+fn default_friend_scale() -> f64 {
+    1.0
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SheepConfig {
     pub name: String,
     pub personality: String,
@@ -17,6 +38,14 @@ pub struct SheepConfig {
     pub lmstudio_endpoint: String,
     #[serde(default = "default_lmstudio_model")]
     pub lmstudio_model: String,
+    #[serde(default)]
+    pub friends: Vec<FriendDef>,
+    #[serde(default = "default_break_reminders")]
+    pub break_reminders: bool,
+    #[serde(default)]
+    pub weather_location: String,
+    #[serde(default)]
+    pub accessories: Vec<String>,
 }
 
 fn default_ai_provider() -> String {
@@ -35,6 +64,10 @@ fn default_language() -> String {
     "nynorsk".to_string()
 }
 
+fn default_break_reminders() -> bool {
+    true
+}
+
 impl Default for SheepConfig {
     fn default() -> Self {
         Self {
@@ -46,6 +79,10 @@ impl Default for SheepConfig {
             ai_provider: "anthropic".to_string(),
             lmstudio_endpoint: "http://localhost:1234".to_string(),
             lmstudio_model: "qwen3.5-9b".to_string(),
+            friends: Vec::new(),
+            break_reminders: true,
+            weather_location: String::new(),
+            accessories: Vec::new(),
         }
     }
 }
@@ -136,4 +173,14 @@ pub fn get_lmstudio_model() -> String {
     load_config()
         .map(|c| c.lmstudio_model)
         .unwrap_or_else(|| "qwen3.5-9b".to_string())
+}
+
+pub fn get_break_reminders() -> bool {
+    load_config().map(|c| c.break_reminders).unwrap_or(true)
+}
+
+pub fn get_weather_location() -> String {
+    load_config()
+        .map(|c| c.weather_location)
+        .unwrap_or_default()
 }

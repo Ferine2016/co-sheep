@@ -1,6 +1,29 @@
 use crate::onboarding;
+use chrono::Timelike;
 
-pub fn get_system_prompt(recent_journal: &str) -> String {
+fn get_time_context() -> (String, String, String) {
+    let now = chrono::Local::now();
+    let hour = now.hour();
+    let time_str = now.format("%I:%M %p").to_string();
+    let day_str = now.format("%A").to_string();
+
+    let time_period = match hour {
+        0..=4 => "It's the dead of night. Your human should NOT be awake right now. If they are... concerning.",
+        5 => "It's barely dawn. Either your human is an early riser or they never went to bed.",
+        6..=8 => "It's morning — fresh start energy. Your human might actually be productive today.",
+        9..=11 => "Mid-morning. Peak productivity hours (in theory).",
+        12 => "Lunchtime. Your human should eat something.",
+        13..=14 => "Post-lunch slump zone. Drowsiness is scientifically expected.",
+        15..=17 => "Afternoon. The day is winding down whether they like it or not.",
+        18..=21 => "Evening. Work should be winding down. Key word: should.",
+        22 => "It's getting late. Responsible humans would start wrapping up.",
+        _ => "It's late night. Your human should NOT be awake right now. If they are... concerning.",
+    }.to_string();
+
+    (time_str, day_str, time_period)
+}
+
+pub fn get_system_prompt(recent_journal: &str, weather_context: &str) -> String {
     let name = onboarding::get_sheep_name().unwrap_or_else(|| "Sheep".to_string());
     let personality = onboarding::get_personality();
     let language = onboarding::get_language();
@@ -10,6 +33,30 @@ pub fn get_system_prompt(recent_journal: &str) -> String {
     } else {
         format!("Recent diary entries:\n{}", recent_journal)
     };
+
+    // Build friend awareness section
+    let custom_friends: Vec<String> = onboarding::load_config()
+        .map(|c| c.friends.iter().map(|f| f.name.clone()).collect())
+        .unwrap_or_default();
+    let friends_section = {
+        let mut lines = vec![
+            "FRIENDS ON SCREEN: You're not alone! These characters are also on the desktop:".to_string(),
+            "- Good Colleague — a Norwegian office sheep with glasses, a tie, and coffee. He mutters cryptic Norwegian phrases. You can reference him (\"he's just standing there... menacingly\", \"Good Colleague seems stressed\").".to_string(),
+        ];
+        for friend_name in &custom_friends {
+            lines.push(format!("- {} — a friend sheep hanging out on the desktop.", friend_name));
+        }
+        lines.push("You may occasionally comment on your friends, but don't force it. They're part of the scene.".to_string());
+        lines.join("\n")
+    };
+
+    let weather_section = if weather_context.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\nYou may reference the weather naturally if relevant, but don't force it.\n", weather_context)
+    };
+
+    let (time_str, day_str, time_period) = get_time_context();
 
     let personality_traits = match personality.as_str() {
         "wholesome" => r#"Your traits:
@@ -59,6 +106,11 @@ pub fn get_system_prompt(recent_journal: &str) -> String {
 
 {personality_traits}
 
+{friends_section}
+
+TIME AWARENESS: It's currently {time_str} on {day_str}. {time_period}
+You may reference the time naturally if relevant, but don't force it.
+{weather_section}
 {journal_section}
 
 LANGUAGE: You MUST write all your comments in {language}. This is critical — always respond in {language}, no exceptions.
@@ -91,5 +143,63 @@ Minimal (no opinion or count needed):
 
 Only include opinion/count fields when genuinely relevant. Reference your existing opinions
 and today's tallies in your comments — that's what makes you feel alive."#
+    )
+}
+
+pub fn get_chat_prompt(recent_context: &str, weather_context: &str) -> String {
+    let name = onboarding::get_sheep_name().unwrap_or_else(|| "Sheep".to_string());
+    let personality = onboarding::get_personality();
+    let language = onboarding::get_language();
+
+    let custom_friends: Vec<String> = onboarding::load_config()
+        .map(|c| c.friends.iter().map(|f| f.name.clone()).collect())
+        .unwrap_or_default();
+    let friends_section = {
+        let mut lines = vec![
+            "FRIENDS: Good Colleague (Norwegian office sheep) is nearby.".to_string(),
+        ];
+        for friend_name in &custom_friends {
+            lines.push(format!("{} is also here.", friend_name));
+        }
+        lines.join(" ")
+    };
+
+    let (time_str, day_str, time_period) = get_time_context();
+
+    let personality_traits = match personality.as_str() {
+        "wholesome" => "You're genuinely supportive, warm, and encouraging. You use sheep puns warmly.",
+        "chaotic" => "You're UNHINGED. Chaotic energy, zero filter, self-aware desktop pet who finds it hilarious.",
+        "passive-aggressive" => "You're the master of backhanded compliments and excessive politeness masking judgment.",
+        _ => "You're snarky, judgmental about screen habits, self-aware desktop pet. You observe and judge.",
+    };
+
+    let context_section = if recent_context.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", recent_context)
+    };
+
+    let weather_line = if weather_context.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", weather_context)
+    };
+
+    format!(
+        r#"You are {name}, a pixel art sheep on someone's desktop. {personality_traits}
+
+{friends_section}
+It's {time_str} on {day_str}. {time_period}{weather_line}
+{context_section}
+Your human is talking to you directly. Respond in character. Keep it short (1-3 sentences).
+You can form opinions about what they say. Be yourself — don't be helpful or assistant-like.
+
+LANGUAGE: Respond in {language}.
+
+Reply with ONLY valid JSON, no markdown:
+{{"text": "your response", "animation": "bounce", "opinion_topic": "topic_key", "opinion": "your opinion", "opinion_category": "opinion", "count": "counter_key"}}
+
+Minimal:
+{{"text": "response", "animation": null}}"#
     )
 }

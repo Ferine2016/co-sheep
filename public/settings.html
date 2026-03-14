@@ -231,6 +231,20 @@
       <div class="hint">The language your sheep speaks in.</div>
     </div>
 
+    <div class="field">
+      <label>Weather Location</label>
+      <input id="weather-location" type="text" placeholder="Oslo, London, Tokyo..." />
+      <div class="hint">City name for weather awareness. Leave empty to disable.</div>
+    </div>
+
+    <div class="field">
+      <label style="display: flex; align-items: center; gap: 8px; text-transform: none; font-size: 14px; color: #eee; cursor: pointer;">
+        <input id="break-reminders" type="checkbox" checked style="width: auto; cursor: pointer;" />
+        Break Reminders
+      </label>
+      <div class="hint">Nudge me to take breaks after 45 min of continuous work.</div>
+    </div>
+
     <div class="actions">
       <button class="cancel-btn" id="cancel-btn">Cancel</button>
       <button class="save-btn" id="save-btn">Save</button>
@@ -258,6 +272,8 @@
       const lmstudioSettings = document.getElementById('lmstudio-settings');
       const lmstudioEndpoint = document.getElementById('lmstudio-endpoint');
       const lmstudioModel = document.getElementById('lmstudio-model');
+      const weatherLocationInput = document.getElementById('weather-location');
+      const breakRemindersCheckbox = document.getElementById('break-reminders');
 
       const descriptions = {
         snarky: 'Judgmental and opinionated, like self-aware Clippy.',
@@ -319,6 +335,8 @@
           aiProvider: aiProviderSelect.value,
           lmstudioEndpoint: lmstudioEndpoint.value.trim() || 'http://localhost:1234',
           lmstudioModel: lmstudioModel.value.trim() || 'qwen3.5-9b',
+          breakReminders: breakRemindersCheckbox.checked,
+          weatherLocation: weatherLocationInput.value.trim(),
         });
         savedMsg.classList.add('visible');
         setTimeout(() => savedMsg.classList.remove('visible'), 3000);
@@ -338,6 +356,8 @@
           aiProviderSelect.value = settings.ai_provider || 'anthropic';
           lmstudioEndpoint.value = settings.lmstudio_endpoint || 'http://localhost:1234';
           lmstudioModel.value = settings.lmstudio_model || 'qwen3.5-9b';
+          weatherLocationInput.value = settings.weather_location || '';
+          breakRemindersCheckbox.checked = settings.break_reminders !== false;
           updateProviderUI();
         } catch (e) {
           console.error('Failed to load settings:', e);

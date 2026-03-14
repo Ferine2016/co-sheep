@@ -42,23 +42,26 @@ fn get_cursor_position() -> (f64, f64) {
 }
 
 pub struct SheepHitState {
-    /// Sheep bounding box in screen logical coordinates: (x, y, width, height)
-    pub bounds: Mutex<(f64, f64, f64, f64)>,
-    /// True while the user is actively dragging the sheep
+    /// All character bounding boxes: Vec<(x, y, width, height)>
+    pub bounds: Mutex<Vec<(f64, f64, f64, f64)>>,
+    /// True while the user is actively dragging any sheep
     pub is_dragging: AtomicBool,
+    /// True while the chat input bubble is open
+    pub is_input_active: AtomicBool,
 }
 
 impl SheepHitState {
     pub fn new() -> Self {
         Self {
-            bounds: Mutex::new((0.0, 0.0, 0.0, 0.0)),
+            bounds: Mutex::new(Vec::new()),
             is_dragging: AtomicBool::new(false),
+            is_input_active: AtomicBool::new(false),
         }
     }
 }
 
 /// Polls global cursor position ~20 times/sec.
-/// Toggles window click-through based on whether the cursor overlaps the sheep.
+/// Toggles window click-through based on whether the cursor overlaps any character.
 pub async fn cursor_tracking_loop(app: tauri::AppHandle) {
     eprintln!("[co-sheep] Cursor tracking loop started, waiting for sheep to spawn...");
     // Wait for the sheep to spawn
@@ -70,30 +73,34 @@ pub async fn cursor_tracking_loop(app: tauri::AppHandle) {
     loop {
         let state = app.state::<SheepHitState>();
 
-        // Never toggle during an active drag — the window must stay interactive
-        if !state.is_dragging.load(Ordering::Relaxed) {
+        // Never toggle during an active drag or chat input — the window must stay interactive
+        if !state.is_dragging.load(Ordering::Relaxed)
+            && !state.is_input_active.load(Ordering::Relaxed)
+        {
             let (cx, cy) = get_cursor_position();
-            let (bx, by, bw, bh) = *state.bounds.lock().unwrap();
+            let bounds_list = state.bounds.lock().unwrap();
 
-            let over_sheep = bw > 0.0
-                && bh > 0.0
-                && cx >= bx
-                && cx <= bx + bw
-                && cy >= by
-                && cy <= by + bh;
+            let over_any = bounds_list.iter().any(|(bx, by, bw, bh)| {
+                *bw > 0.0
+                    && *bh > 0.0
+                    && cx >= *bx
+                    && cx <= *bx + *bw
+                    && cy >= *by
+                    && cy <= *by + *bh
+            });
 
             // Only log on state change to avoid spamming
-            if over_sheep != was_over {
+            if over_any != was_over {
                 eprintln!(
-                    "[co-sheep] Cursor {} sheep (cursor: {:.0},{:.0} | bounds: {:.0},{:.0} {:.0}x{:.0})",
-                    if over_sheep { "OVER" } else { "LEFT" },
-                    cx, cy, bx, by, bw, bh,
+                    "[co-sheep] Cursor {} character (cursor: {:.0},{:.0})",
+                    if over_any { "OVER" } else { "LEFT" },
+                    cx, cy,
                 );
-                was_over = over_sheep;
+                was_over = over_any;
             }
 
             if let Some(window) = app.get_webview_window("main") {
-                window.set_ignore_cursor_events(!over_sheep).ok();
+                window.set_ignore_cursor_events(!over_any).ok();
             }
         }
 

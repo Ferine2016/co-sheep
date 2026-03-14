@@ -45,18 +45,32 @@ body.dragging {
   pointer-events: none;
 }
 
-/* Tail pointing down */
-.speech-bubble::after {
+/* Tail pointing down — outer border triangle */
+.speech-bubble::before {
   content: "";
   position: absolute;
-  bottom: -10px;
+  bottom: -11px;
   left: 50%;
   transform: translateX(-50%);
   width: 0;
   height: 0;
-  border-left: 10px solid transparent;
-  border-right: 10px solid transparent;
-  border-top: 10px solid #1a1a2e;
+  border-left: 11px solid transparent;
+  border-right: 11px solid transparent;
+  border-top: 11px solid var(--bubble-border-color, #e94560);
+}
+
+/* Tail pointing down — inner background fill */
+.speech-bubble::after {
+  content: "";
+  position: absolute;
+  bottom: -8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 8px solid transparent;
+  border-right: 8px solid transparent;
+  border-top: 8px solid #1a1a2e;
 }
 
 .speech-bubble-text {
@@ -105,4 +119,19 @@ body.dragging {
 
 .input-bubble-button:hover {
   background: #ff6b6b;
+}
+
+.input-bubble-input:disabled {
+  opacity: 0.5;
+}
+
+.input-bubble-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.input-bubble-loading {
+  font-style: italic;
+  color: #888;
+  padding: 4px 0;
 }
